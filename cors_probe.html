@@ -92,14 +92,27 @@ $('bEnv').onclick = () => {
   put('navigator.onLine          = ' + navigator.onLine);
   const ua = navigator.userAgent;
   put('微信内置浏览器            = ' + (/MicroMessenger/i.test(ua) ? '是' : '否'));
+  // 浏览器标识单独抽出来：UA 里的 MQQBrowser 等字样很容易被看成“系统浏览器”
+  const br = ua.match(/(MicroMessenger|[A-Za-z0-9]*Browser)\/([\d.]+)/i);
+  put('浏览器标识                = ' + (br ? br[1] + '/' + br[2] : '未识别（可能是系统自带浏览器）'));
   put('内核线索                  = ' +
-      (/MicroMessenger/i.test(ua) ? 'MicroMessenger' : '') +
-      (/Chrome\/[\d.]+/.test(ua) ? ' Chrome' : '') +
-      (/Safari\//.test(ua) ? ' Safari' : '') +
+      (/MicroMessenger/i.test(ua) ? 'MicroMessenger ' : '') +
+      (/MQQBrowser/i.test(ua) ? 'MQQBrowser ' : '') +
+      (/XWEB/i.test(ua) ? 'XWEB ' : '') +
+      (/Chrome\/[\d.]+/.test(ua) ? 'Chrome ' : '') +
+      (/Safari\//.test(ua) ? 'Safari' : '') +
       (/iPhone|iPad|iOS/i.test(ua) ? ' iOS' : (/Android/i.test(ua) ? ' Android' : ' 桌面/其他')));
+  // 移动网络证据：微信 UA 带 NetType/5G，QQ 浏览器等很多内核根本不带这个字段
+  const net = ua.match(/NetType\/([A-Za-z0-9]+)/i);
+  put('UA 声明的网络类型 NetType = ' + (net ? net[1] : '无'));
+  put('  ↑ 这一行是“到底走没走移动网络”的唯一读数证据。显示“无”时，本轮只能靠你自己确认已关 Wi-Fi，读数本身证明不了。');
   put('ReadableStream 可用       = ' + (typeof Response !== 'undefined' && 'body' in Response.prototype ? '是' : '需实测'));
   put('User-Agent 全文           = ' + ua);
-  put('判读：微信内置浏览器 = 是 且 出现失败时，先用系统浏览器重跑一次再下结论');
+  if (/MicroMessenger/i.test(ua)) {
+    put('提示：本轮在微信内置浏览器。若接下来出现失败，先用系统浏览器重跑一次再下结论。');
+  } else {
+    put('提示：本轮不是微信内置浏览器（UA 里没有 MicroMessenger）。微信内置浏览器那一轮需要另外测。');
+  }
   put('');
 };
 
