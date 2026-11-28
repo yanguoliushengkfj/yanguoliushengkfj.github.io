@@ -103,9 +103,11 @@
     border-top: 1px solid var(--line);
     padding: 8px 10px;
     display: flex;
-    gap: 8px;
-    align-items: flex-end;
+    flex-direction: column;
+    gap: 6px;
+    align-items: stretch;
   }
+  footer .inrow { display: flex; gap: 8px; align-items: flex-end; }
   footer textarea { flex: 1; max-height: 120px; min-height: 42px; resize: none; }
   .sheet {
     background: var(--panel);
@@ -152,6 +154,20 @@
   }
   .chk { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--dim); margin: 10px 0 0; }
   .chk input { width: auto; }
+  /* 朗读状态条：固定在输入区上方，长回答不必滑到末尾找「停止」 */
+  #ttsBar { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--dim); padding: 0 2px; }
+  #ttsBar.hidden { display: none; }
+  #ttsBar b { color: var(--ok); font-weight: 600; }
+  #ttsBar button { padding: 4px 10px; font-size: 13px; border-radius: 7px; }
+  body.tts-on { padding-bottom: 118px; }
+  /* Markdown 表格：模型常输出表格，手机上允许横向滚动，长链接允许折行 */
+  .tblwrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 6px 0; }
+  table.md { border-collapse: collapse; width: 100%; font-size: 13px; line-height: 1.5; white-space: normal; }
+  table.md th, table.md td {
+    border: 1px solid var(--line); padding: 5px 7px;
+    text-align: left; vertical-align: top; word-break: break-all;
+  }
+  table.md th { background: #182029; font-weight: 600; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -189,7 +205,7 @@
     <label class="chk"><input id="optProcess" type="checkbox"> 显示「它查了哪几处」</label>
     <p class="src">开着才能在回答下面看到这次取回的材料与查询明细；关掉时只显示回答文本。</p>
     <label class="chk"><input id="optTts" type="checkbox"> 朗读回答</label>
-    <p class="src">开着时，回答文字一边出现，本机语音一边念，每攒够两个完整句子开口一次。长回答可以随时点「停止」。</p>
+    <p class="src" id="ttsHint">正在检查这台手机的朗读条件…</p>
     <div class="row">
       <button id="btnSaveCfg" class="primary" type="button">保存</button>
       <button id="btnNewSess" type="button">开新会话</button>
@@ -216,8 +232,14 @@
 </main>
 
 <footer>
-  <textarea id="inp" rows="1" maxlength="8000" placeholder="提问…"></textarea>
-  <button id="btnSend" class="primary" type="button">发送</button>
+  <div id="ttsBar" class="hidden">
+    <b>正在朗读</b>
+    <button id="btnTtsStop" type="button">停止</button>
+  </div>
+  <div class="inrow">
+    <textarea id="inp" rows="1" maxlength="8000" placeholder="提问…"></textarea>
+    <button id="btnSend" class="primary" type="button">发送</button>
+  </div>
 </footer>
 
 <script>
@@ -555,6 +577,41 @@ function addSrcLine(node, text) {
   node.appendChild(d);
 }
 
+function isTableLine(line) {
+  return /^\|.*\|$/.test((line || '').trim());
+}
+
+function isTableSep(line) {
+  var s = (line || '').trim();
+  return isTableLine(s) && /^[\s:|-]+$/.test(s) && s.indexOf('-') >= 0;
+}
+
+function tableCells(line) {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|')
+    .map(function (x) { return x.replace(/\*\*/g, '').trim(); });
+}
+
+// 模型常把公告清单写成 Markdown 表格。原样显示会是一排竖线，手机上几乎没法读；
+// 这里转成真正的表格，长链接由 td 的 break-all 折行，整表可横向滚动。
+function renderTable(node, rows) {
+  var wrap = document.createElement('div');
+  wrap.className = 'tblwrap';
+  var table = document.createElement('table');
+  table.className = 'md';
+  for (var r = 0; r < rows.length; r++) {
+    var tr = document.createElement('tr');
+    var cells = tableCells(rows[r]);
+    for (var c = 0; c < cells.length; c++) {
+      var cell = document.createElement(r === 0 ? 'th' : 'td');
+      appendInline(cell, cells[c]);
+      tr.appendChild(cell);
+    }
+    table.appendChild(tr);
+  }
+  wrap.appendChild(table);
+  node.appendChild(wrap);
+}
+
 function renderAnswer(node, text) {
   node.textContent = '';
   if (!text) { return; }
@@ -562,6 +619,18 @@ function renderAnswer(node, text) {
   for (var i = 0; i < lines.length; i++) {
     var t = lines[i].replace(/\s+$/, '').replace(/^\s+/, '');
     if (!t) { continue; }
+    // 表格：本行与下一行构成「表头 + 分隔行」时，把连续的表行整块收走
+    if (isTableLine(t) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      var rows = [];
+      var j = i;
+      while (j < lines.length && isTableLine(lines[j])) {
+        if (!isTableSep(lines[j])) { rows.push(lines[j].trim()); }
+        j++;
+      }
+      renderTable(node, rows);
+      i = j - 1;
+      continue;
+    }
     // 整行就是来源行，直接变成小字一行
     var whole = /^[（(]?\s*来源[：:]\s*(.+?)[）)]?$/.exec(t);
     if (whole) { addSrcLine(node, '来源：' + whole[1]); continue; }
@@ -896,10 +965,74 @@ function renderExtras(node, st) {
 // 两句一批：一句太碎，三句首声就晚。队列必然积压——文字先出完、语音后念完，靠「停止」收。
 var ttsQueue = [];
 var ttsBusy = false;
+var ttsPaused = false;   // 本轮点过「停止」：后续流式文本不再自动入队，直到下一轮或点「朗读」
 
 function ttsAvailable() {
   return typeof window.speechSynthesis !== 'undefined' &&
          typeof window.SpeechSynthesisUtterance !== 'undefined';
+}
+
+function ttsActive() { return ttsBusy || ttsQueue.length > 0; }
+
+// 输入区上方的状态条与回答末尾那个按钮共用同一份状态，避免两处显示不一致
+function ttsSyncBar() {
+  var on = ttsActive();
+  var bar = document.getElementById('ttsBar');
+  if (bar) { bar.classList.toggle('hidden', !on); }
+  document.body.classList.toggle('tts-on', on);
+  var btns = document.querySelectorAll('.ttsbtn');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].textContent = on ? '停止' : '朗读';
+  }
+}
+
+// 设置面板里把三件事说清楚：接口有没有、中文语音有没有、是不是开在应用内浏览器。
+// 否则用户勾了没声，只能猜。
+function ttsZhVoices() {
+  try {
+    var vs = window.speechSynthesis.getVoices() || [];
+    var zh = 0;
+    for (var i = 0; i < vs.length; i++) {
+      if (/^zh/i.test(vs[i].lang || '')) { zh++; }
+    }
+    return { total: vs.length, zh: zh };
+  } catch (e) {
+    return { total: 0, zh: 0 };
+  }
+}
+
+function inAppBrowser() {
+  return /MicroMessenger|QQ\/|Weibo|AlipayClient|DingTalk|Lark|aweme|BytedanceWebview/i
+    .test(navigator.userAgent || '');
+}
+
+function refreshTtsHint() {
+  var hint = document.getElementById('ttsHint');
+  if (!hint) { return; }
+  if (!ttsAvailable()) {
+    elTts.checked = false;
+    elTts.disabled = true;
+    lsSet(KEY_TTS, '0');
+    hint.textContent = '这个浏览器不提供朗读接口，勾了也不会有声音。请把网址复制到手机自带的浏览器'
+      + '（Chrome、Edge、Safari）再打开。';
+    return;
+  }
+  elTts.disabled = false;
+  var v = ttsZhVoices();
+  var parts = [];
+  if (inAppBrowser()) {
+    parts.push('当前页面开在微信、QQ 这类应用里面，朗读可能被拦截；没有声音时请换系统浏览器。');
+  }
+  if (v.zh) {
+    parts.push('本机可用中文语音 ' + v.zh + ' 个。');
+  } else if (v.total) {
+    parts.push('本机没有找到中文语音，朗读可能无声或读成英文；请先在系统设置里添加中文语音。');
+  } else {
+    parts.push('本机暂时没有给出语音列表，仍可先试；没有声音时请换系统浏览器，或在系统设置里检查文字转语音。');
+  }
+  hint.textContent = parts.join('')
+    + '开着时，回答文字一边出现，本机语音一边念，每攒够两个完整句子开口一次；'
+    + '朗读中在输入框上方点「停止」随时停。';
 }
 
 // iOS 只认「真实点击」里的第一次 speak。先占住音频通道，后面异步 speak 才有声。
@@ -915,9 +1048,11 @@ function ttsPrime() {
 function ttsStop() {
   ttsQueue = [];
   ttsBusy = false;
+  ttsPaused = true;
   if (ttsAvailable()) {
     try { window.speechSynthesis.cancel(); } catch (e) {}
   }
+  ttsSyncBar();
 }
 
 // 按句末标点切成句子。末尾没有标点的那截标成 complete:false，留给收尾补念。
@@ -937,15 +1072,45 @@ function ttsSplit(text) {
   return out;
 }
 
-// 念不出来的东西先摘掉：链接、列表符号、星号、整行来源、行尾来源括注
-function scrubForTts(text) {
-  return text.replace(URL_RE, '')
+// 念不出来的东西先摘掉：链接、列表符号、星号、整行来源、行尾来源括注。
+// 表格：模型常把公告清单写成 | 日期 | 标题 | 链接 |，直接念是一片「竖线」；
+// 先去掉分隔行、把竖线换成逗号，只念前 6 行，其余用一句话带过。
+// state 用来在流式分批之间累计已念的表行：朗读是每两句送一次，计数不能每次从头算。
+function scrubForTts(text, state) {
+  var lines = (text || '').split('\n');
+  var out = [];
+  var rows = state ? state.ttsRows : 0;
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    if (/^\s*\|/.test(ln)) {
+      if (/^\s*\|?[\s:|-]+\|?\s*$/.test(ln)) { continue; }
+      rows++;
+      if (rows > 6) {
+        if (rows === 7) { out.push('表格其余行见页面。'); }
+        continue;
+      }
+      var cells = ln.trim().replace(/^\|/, '').replace(/\|$/, '').split('|');
+      var kept = [];
+      for (var k = 0; k < cells.length; k++) {
+        var c = cells[k].replace(/\s+/g, ' ').trim();
+        if (c) { kept.push(c); }
+      }
+      ln = kept.join('，');
+    } else {
+      if (ln.trim()) { rows = 0; }   // 空行不重置：每批末尾都带换行，重置了计数就跨不了批次
+    }
+    out.push(ln);
+  }
+  if (state) { state.ttsRows = rows; }
+  return out.join('\n').replace(URL_RE, '')
     .replace(/^[ \t]*[-*#]+[ \t]+/gm, '')
     .replace(/\*\*/g, '')
     .replace(/^[（(]?\s*来源[：:].*$/gm, '')
     .replace(/[（(]\s*来源[：:][^）)]{0,80}[）)]/g, '')
     .replace(/重要度\s*\d+\s*[·•]\s*/g, '')
     .replace(/[·•]/g, '，')
+    .replace(/，[ \t]*[。；]/g, '。')
+    .replace(/，[ \t]*$/gm, '')
     .replace(/[ \t\u3000]{2,}/g, ' ');
 }
 
@@ -956,24 +1121,26 @@ function ttsDrain() {
   var u = new SpeechSynthesisUtterance(text);
   u.lang = 'zh-CN';
   u.rate = 1.0;
-  u.onend = function () { ttsBusy = false; ttsDrain(); };
-  u.onerror = function () { ttsBusy = false; ttsDrain(); };
+  u.onend = function () { ttsBusy = false; ttsSyncBar(); ttsDrain(); };
+  u.onerror = function () { ttsBusy = false; ttsSyncBar(); ttsDrain(); };
   try {
     window.speechSynthesis.speak(u);
   } catch (e) {
     ttsBusy = false;
+    ttsSyncBar();
     ttsDrain();
   }
+  ttsSyncBar();
 }
 
 // 流式帧每追加一段就调一次：只要后面还有两个完整句，就切出来入队
 function ttsBatch(st) {
-  if (!ttsOn() || !ttsAvailable()) { return; }
+  if (!ttsOn() || !ttsAvailable() || ttsPaused) { return; }
   var sents = ttsSplit(st.text.slice(st.spokenIdx));
   var i = 0;
   while (i + 1 < sents.length && sents[i + 1].complete) {
     var joined = sents[i].text + sents[i + 1].text;
-    var clean = scrubForTts(joined);
+    var clean = scrubForTts(joined, st);
     i += 2;
     if (clean.replace(/\s/g, '')) { ttsQueue.push(clean); }
   }
@@ -984,8 +1151,8 @@ function ttsBatch(st) {
 // 只在本轮真的收到 stop 帧时调：把最后不足两句的尾巴补进去。
 // 超时或截断时不调，避免把半截回答念成完整结论。
 function ttsFlushTail(st) {
-  if (!ttsOn() || !ttsAvailable()) { return; }
-  var clean = scrubForTts(st.text.slice(st.spokenIdx));
+  if (!ttsOn() || !ttsAvailable() || ttsPaused) { return; }
+  var clean = scrubForTts(st.text.slice(st.spokenIdx), st);
   st.spokenIdx = st.text.length;
   if (clean.replace(/\s/g, '')) {
     ttsQueue.push(clean);
@@ -996,7 +1163,8 @@ function ttsFlushTail(st) {
 // 兜底按钮：整段重念，约 60 字一段，避免单个 utterance 太长被浏览器截断
 function ttsSpeakAll(text) {
   ttsStop();
-  var sents = ttsSplit(scrubForTts(text));
+  ttsPaused = false;
+  var sents = ttsSplit(scrubForTts(text, { ttsRows: 0 }));
   var buf = '';
   for (var i = 0; i < sents.length; i++) {
     buf += sents[i].text;
@@ -1008,26 +1176,13 @@ function ttsSpeakAll(text) {
 
 function addTtsBtn(node, st) {
   if (!ttsAvailable()) { return; }
-  var timer = 0;
   var b = document.createElement('button');
   b.type = 'button';
-  b.textContent = (ttsBusy || ttsQueue.length) ? '停止' : '朗读';
+  b.className = 'ttsbtn';
+  b.textContent = ttsActive() ? '停止' : '朗读';
   b.addEventListener('click', function () {
-    if (timer) { clearInterval(timer); timer = 0; }
-    if (ttsBusy || ttsQueue.length) {
-      ttsStop();
-      b.textContent = '朗读';
-      return;
-    }
+    if (ttsActive()) { ttsStop(); return; }
     ttsSpeakAll(st.text);
-    b.textContent = '停止';
-    timer = setInterval(function () {
-      if (!ttsBusy && !ttsQueue.length) {
-        clearInterval(timer);
-        timer = 0;
-        b.textContent = '朗读';
-      }
-    }, 500);
   });
   node.appendChild(b);
 }
@@ -1042,6 +1197,7 @@ async function sendText(promptText) {
   elSend.disabled = true;
   lastPrompt = promptText;
   ttsStop();                     // 新一轮开始，先把上一条没念完的停掉
+  ttsPaused = false;             // 新问题重新允许自动朗读（上一条点过停止也不影响这一条）
   ttsPrime();                    // 必须在 ttsStop 之后：先解锁再开声，否则预热会被 cancel 掉
   addMsg('me', promptText);
 
@@ -1049,7 +1205,7 @@ async function sendText(promptText) {
     t0: Date.now(), chunks: 0, bytes: 0, frames: 0, parseFail: 0,
     text: '', gotContent: false, firstTextMs: 0, stopped: false,
     sessionSaved: false, usage: null, upstreamError: '', upstreamRequestId: '', renderTick: false,
-    tools: [], thoughts: [], spokenIdx: 0
+    tools: [], thoughts: [], spokenIdx: 0, ttsRows: 0
   };
 
   var aiNode = addMsg('ai', '');
@@ -1252,7 +1408,10 @@ elProc.addEventListener('change', function () {
 });
 elTts.addEventListener('change', function () {
   lsSet(KEY_TTS, elTts.checked ? '1' : '0');
-  if (elTts.checked) { ttsPrime(); } else { ttsStop(); }
+  if (elTts.checked) { ttsPaused = false; ttsPrime(); } else { ttsStop(); }
+});
+document.getElementById('btnTtsStop').addEventListener('click', function () {
+  ttsStop();
 });
 // 切到后台就停，避免锁屏之后还在念
 document.addEventListener('visibilitychange', function () {
@@ -1282,6 +1441,13 @@ document.getElementById('btnWipe').addEventListener('click', function () {
   if (!lsGet(KEY_BASE)) { lsSet(KEY_BASE, DEFAULT_BASE); }
   elProc.checked = showProcessOn();
   elTts.checked = ttsOn();
+  refreshTtsHint();
+  if (ttsAvailable()) {
+    try {
+      window.speechSynthesis.addEventListener('voiceschanged', refreshTtsHint);
+    } catch (e) {}
+    setTimeout(refreshTtsHint, 800);   // 部分安卓浏览器要等一会才给出语音列表
+  }
   refreshStatus();
   if (!token()) {
     openGate(false);
