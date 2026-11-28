@@ -122,6 +122,31 @@
   #wait { font-size: 13px; color: var(--warn); }
   details { margin-top: 10px; font-size: 13px; color: var(--dim); }
   summary { cursor: pointer; color: var(--fg); }
+  /* 批次 8：来源行 / 证据标签 / 状态横幅 / 材料清单 / 查询明细。
+     颜色只用于「次要信息」，证据等级与重要度一律不用颜色编码（§14 第 5 条硬线）。 */
+  .disc { font-size: 12px; color: var(--dim); margin: 0 2px 8px; }
+  .footnote {
+    font-size: 12px; color: var(--dim); line-height: 1.7;
+    margin: 18px 2px 8px; border-top: 1px solid var(--line); padding-top: 10px;
+  }
+  .ln { min-height: 1px; }
+  .lnk { color: #7fb3e0; text-decoration: none; word-break: break-all; }
+  .src { font-size: 11.5px; color: var(--dim); margin-top: 2px; word-break: break-all; }
+  .tag {
+    display: inline-block; font-size: 11px; color: var(--dim);
+    border: 1px solid var(--line); border-radius: 6px; padding: 0 5px; margin-left: 6px;
+  }
+  .banner {
+    border: 1px solid var(--line); border-radius: 9px; background: #182029;
+    padding: 8px 10px; margin-top: 8px; font-size: 12.5px;
+  }
+  .banner .h { color: var(--warn); }
+  .block { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 8px; }
+  .block h4 { margin: 0 0 6px; font-size: 12.5px; color: var(--dim); font-weight: 600; }
+  .rowitem { font-size: 13px; margin: 6px 0; line-height: 1.55; }
+  .rowitem .m { font-size: 11.5px; color: var(--dim); }
+  .chk { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--dim); margin: 10px 0 0; }
+  .chk input { width: auto; }
 </style>
 </head>
 <body>
@@ -154,6 +179,8 @@
     <input id="baseIn" type="text" autocomplete="off" spellcheck="false" inputmode="url">
     <label for="tokIn2">访问口令</label>
     <input id="tokIn2" type="password" autocomplete="off" spellcheck="false">
+    <label class="chk"><input id="optProcess" type="checkbox"> 显示「它查了哪几处」</label>
+    <p class="src">开着才能在回答下面看到这次取回的材料与查询明细；关掉时只显示回答文本。</p>
     <div class="row">
       <button id="btnSaveCfg" class="primary" type="button">保存</button>
       <button id="btnNewSess" type="button">开新会话</button>
@@ -169,7 +196,14 @@
     </details>
   </div>
 
+  <div id="discTop" class="disc">内容由 AI 依据公开信息生成，可能有错</div>
   <div id="log"></div>
+  <div class="footnote">
+    本页面内容由 AI 自动生成，仅供参考，不构成任何投资建议。<br>
+    新闻与公告来自第三方公开接口，本站不对其准确性与完整性负责；
+    涉及公司披露事项，请以交易所指定信息披露渠道的原文为准。<br>
+    研报摘要为发布机构的观点，与本网站及上市公司立场无关。
+  </div>
   <div id="wait" class="msg ai hidden"></div>
 </main>
 
@@ -187,6 +221,7 @@ var DEFAULT_BASE = 'https://fintrack-h-bff-edmghafbbc.cn-beijing.fcapp.run';
 var KEY_BASE = 'h5page.base';
 var KEY_TOKEN = 'h5page.token';
 var KEY_SESSION = 'h5page.sessionId';
+var KEY_PROC = 'h5page.showProcess';
 var CHAT_PATH = '/api/chat';
 
 // 前端兜底超时 60 s。函数侧 TOTAL_DEADLINE 是 55 s，正常应该由服务端先收尾，
@@ -204,6 +239,7 @@ var elTok = document.getElementById('tokIn');
 var elTok2 = document.getElementById('tokIn2');
 var elBase = document.getElementById('baseIn');
 var elTokMsg = document.getElementById('tokMsg');
+var elProc = document.getElementById('optProcess');
 
 var busy = false;
 var lastPrompt = '';
@@ -222,6 +258,8 @@ function apiBase() {
 }
 function token() { return lsGet(KEY_TOKEN) || ''; }
 function sessionId() { return lsGet(KEY_SESSION) || ''; }
+// 默认开：开着才能拿到工具返回、画材料清单与查询明细；存成 '0' 才算关。
+function showProcessOn() { return lsGet(KEY_PROC) !== '0'; }
 
 function setStatus(text, color) {
   elStatus.textContent = text;      // 本页不用 innerHTML 拼任何东西：session_id 来自服务端，不例外
@@ -362,6 +400,15 @@ function makeFrameHandler(st, node, onDone) {
     st.frames += 1;
     var obj;
     try { obj = JSON.parse(dataStr); } catch (e) { st.parseFail += 1; return; }
+    // 批次 8：BFF 的两种旁路事件都不带 output，不能当正文帧处理
+    if (obj && obj.bff_kind === 'tool') {
+      if (obj.result) { st.tools.push(obj); }
+      return;
+    }
+    if (obj && obj.bff_kind === 'thought') {
+      st.thoughts.push(obj);
+      return;
+    }
     if (obj.code && obj.code !== '') {
       // 上游把错误塞进 200 流里时报文带 code。BFF 不解析负载，所以这里是本页唯一读它的地方。
       st.upstreamError = obj.code + ' / ' + (obj.message || '');
@@ -440,6 +487,337 @@ async function readStream(resp, node, st, frameHandler) {
   return pending;
 }
 
+// ---------- 回答渲染（批次 8 七项） ----------
+// 两条硬约束贯穿这一段：① 一律 createElement + textContent，模型输出与工具返回都不许当 HTML；
+// ② 证据等级与重要度不用颜色（§14 第 5 条），只用文字与灰色小字。
+var TOOL_LABEL = {
+  news_search: '公司新闻', announcement_search: '公司公告', live_feed: '快讯',
+  research_report: '研究报告', qa_search: '互动问答', policy_search: '政策与监管文件',
+  event_calendar: '未来安排', document_text: '正文取回'
+};
+var URL_RE = /https?:\/\/[^\s<>"'”’）)】]+/g;
+
+function toolLabel(name) { return TOOL_LABEL[name] || name || '工具'; }
+
+function appendInline(parent, text) {
+  // 只把 http/https 地址做成链接，其余一字符不改地放进文本节点。
+  var idx = 0;
+  var m;
+  URL_RE.lastIndex = 0;
+  while ((m = URL_RE.exec(text)) !== null) {
+    var url = m[0].replace(/[.,;:，。；：、]+$/, '');
+    if (m.index > idx) {
+      parent.appendChild(document.createTextNode(text.slice(idx, m.index)));
+    }
+    var a = document.createElement('a');
+    a.className = 'lnk';
+    a.href = url;
+    a.textContent = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    parent.appendChild(a);
+    idx = m.index + url.length;
+    URL_RE.lastIndex = idx;
+  }
+  if (idx < text.length) {
+    parent.appendChild(document.createTextNode(text.slice(idx)));
+  }
+}
+
+function addSrcLine(node, text) {
+  var d = document.createElement('div');
+  d.className = 'src';
+  appendInline(d, text);
+  node.appendChild(d);
+}
+
+function renderAnswer(node, text) {
+  node.textContent = '';
+  if (!text) { return; }
+  var lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var t = lines[i].replace(/\s+$/, '').replace(/^\s+/, '');
+    if (!t) { continue; }
+    // 整行就是来源行，直接变成小字一行
+    var whole = /^[（(]?\s*来源[：:]\s*(.+?)[）)]?$/.exec(t);
+    if (whole) { addSrcLine(node, '来源：' + whole[1]); continue; }
+    // 行尾的来源括注拆出来，§14 第一项要的就是这个
+    var tail = /[（(]\s*来源[：:]\s*([^）)]{1,80})[）)]\s*$/.exec(t);
+    var body = t;
+    if (tail) { body = t.slice(0, tail.index); }
+    body = body.replace(/\*\*/g, '');       // 成对星号只是强调，不上屏
+    var div = document.createElement('div');
+    div.className = 'ln';
+    appendInline(div, body);
+    node.appendChild(div);
+    if (tail) { addSrcLine(node, '来源：' + tail[1]); }
+  }
+}
+
+function itemTime(s) {
+  if (typeof s !== 'string' || !s) { return ''; }
+  if (s.length >= 16) { return s.slice(5, 16); }
+  return s;
+}
+
+function collectItems(results) {
+  var out = [];
+  var seen = {};
+  for (var i = 0; i < results.length; i++) {
+    var arr = (results[i].result || {}).items || [];
+    for (var j = 0; j < arr.length; j++) {
+      var it = arr[j];
+      if (!it || !it.title) { continue; }
+      var key = it.url || (it.title + '|' + (it.published_at || ''));
+      if (seen[key]) { continue; }
+      seen[key] = 1;
+      out.push(it);
+    }
+  }
+  out.sort(function (a, b) {
+    var x = a.published_at || '';
+    var y = b.published_at || '';
+    if (x === y) { return 0; }
+    if (!x) { return 1; }
+    if (!y) { return -1; }
+    return x < y ? -1 : 1;
+  });
+  return out;
+}
+
+function appendItemRow(block, it) {
+  var row = document.createElement('div');
+  row.className = 'rowitem';
+  if (typeof it.importance === 'number' && it.importance > 0) {
+    var im = document.createElement('span');
+    im.className = 'm';
+    im.textContent = '重要度 ' + it.importance + ' · ';
+    row.appendChild(im);
+  }
+  if (it.url && /^https?:\/\//.test(it.url)) {
+    var a = document.createElement('a');
+    a.className = 'lnk';
+    a.href = it.url;
+    a.textContent = it.title;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    row.appendChild(a);
+  } else {
+    row.appendChild(document.createTextNode(it.title));
+  }
+  // 只标例外：INDIRECT 挂灰字，DIRECT 不挂（§14 第五项）
+  if (it.evidence_grade === 'INDIRECT') {
+    var tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = '依据是转载摘要';
+    row.appendChild(tag);
+  } else if (it.evidence_grade === 'NONE') {
+    var tag2 = document.createElement('span');
+    tag2.className = 'tag';
+    tag2.textContent = '只拿到标题';
+    row.appendChild(tag2);
+  }
+  var meta = document.createElement('div');
+  meta.className = 'm';
+  var bits = [];
+  if (it.source) { bits.push(it.source); }
+  bits.push(it.published_at ? itemTime(it.published_at) : '未给时间');
+  if (it.category) { bits.push(it.category); }
+  if (it.answer_status) {
+    bits.push(it.answer_status === 'ANSWERED' ? '已回答' : '未回答');
+  }
+  meta.textContent = bits.join(' · ');
+  row.appendChild(meta);
+  block.appendChild(row);
+}
+
+function renderBanners(node, results) {
+  var seen = {};
+  for (var i = 0; i < results.length; i++) {
+    var r = results[i];
+    var res = r.result || {};
+    var dr = res.degrade_reason;
+    if (dr && dr !== 'OK') {
+      var key = r.tool + '|' + dr;
+      if (!seen[key]) {
+        seen[key] = 1;
+        var b = document.createElement('div');
+        b.className = 'banner';
+        var h = document.createElement('div');
+        h.className = 'h';
+        h.textContent = toolLabel(r.tool) + '：' +
+          (dr === 'NO_ARTICLE' ? '这一类确实没有' : '这一类这次取不到');
+        b.appendChild(h);
+        if (dr !== 'NO_ARTICLE' && res.degrade_hint) {
+          var p = document.createElement('div');
+          p.className = 'src';
+          p.textContent = res.degrade_hint;
+          b.appendChild(p);
+        }
+        node.appendChild(b);
+      }
+    }
+    if (res.missing_sources && res.missing_sources.length) {
+      var b2 = document.createElement('div');
+      b2.className = 'banner';
+      var h2 = document.createElement('div');
+      h2.className = 'h';
+      h2.textContent = toolLabel(r.tool) + '：有来源这次没查到';
+      b2.appendChild(h2);
+      var p2 = document.createElement('div');
+      p2.className = 'src';
+      p2.textContent = res.missing_sources.join('、');
+      b2.appendChild(p2);
+      node.appendChild(b2);
+    }
+  }
+}
+
+function renderItems(node, results) {
+  var items = collectItems(results);
+  if (!items.length) { return; }
+  var byUrl = {};
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].url) { byUrl[items[i].url] = items[i]; }
+  }
+  var block = document.createElement('div');
+  block.className = 'block';
+  var h = document.createElement('h4');
+  h.textContent = '这次取回的材料（按时间先后，共 ' + items.length + ' 条）';
+  block.appendChild(h);
+  var done = {};
+  var rows = 0;
+  var limit = Math.min(items.length, 40);
+  for (var k = 0; k < items.length && rows < limit; k++) {
+    var it = items[k];
+    var kkey = it.url || it.title;
+    if (done[kkey]) { continue; }
+    appendItemRow(block, it);
+    done[kkey] = 1;
+    rows += 1;
+    // 冲突对：两条各自成行、紧挨着放，并明说数字不一致（不挑一条，不说哪个对）
+    var pair = (it.conflict_with && it.conflict_with.length) ? it.conflict_with : null;
+    if (pair) {
+      for (var q = 0; q < pair.length; q++) {
+        var other = byUrl[pair[q]];
+        if (other && !done[other.url || other.title] && rows < limit) {
+          appendItemRow(block, other);
+          done[other.url || other.title] = 1;
+          rows += 1;
+        }
+      }
+      var w = document.createElement('div');
+      w.className = 'src';
+      w.textContent = '以上两条的数字不一致，两个都列出，没有取舍。';
+      block.appendChild(w);
+    }
+  }
+  node.appendChild(block);
+}
+
+function renderEvents(node, results) {
+  var evs = [];
+  var seen = {};
+  for (var i = 0; i < results.length; i++) {
+    var arr = (results[i].result || {}).events || [];
+    for (var j = 0; j < arr.length; j++) {
+      var e = arr[j];
+      if (!e || (!e.name && !e.detail)) { continue; }
+      var key = (e.date || '') + '|' + (e.type || '') + '|' + (e.name || '') +
+        '|' + String(e.detail || '').slice(0, 40);
+      if (seen[key]) { continue; }
+      seen[key] = 1;
+      evs.push(e);
+    }
+  }
+  if (!evs.length) { return; }
+  evs.sort(function (a, b) {
+    var x = a.date || '';
+    var y = b.date || '';
+    if (x === y) { return 0; }
+    if (!x) { return 1; }
+    if (!y) { return -1; }
+    return x < y ? -1 : 1;
+  });
+  var block = document.createElement('div');
+  block.className = 'block';
+  var h = document.createElement('h4');
+  h.textContent = '未来安排（' + evs.length + ' 条）';
+  block.appendChild(h);
+  for (var k = 0; k < evs.length && k < 40; k++) {
+    var e2 = evs[k];
+    var row = document.createElement('div');
+    row.className = 'rowitem';
+    var when = document.createElement('span');
+    when.className = 'm';
+    when.textContent = (e2.date || '日期未给') + ' · ';
+    row.appendChild(when);
+    row.appendChild(document.createTextNode((e2.name || '') +
+      (e2.type ? '（' + e2.type + '）' : '')));
+    if (e2.detail) {
+      var d = document.createElement('div');
+      d.className = 'src';
+      d.textContent = e2.detail;
+      row.appendChild(d);
+    }
+    block.appendChild(row);
+  }
+  node.appendChild(block);
+}
+
+function renderTrace(node, st) {
+  var calls = [];
+  for (var i = 0; i < st.tools.length; i++) {
+    calls.push({ tool: st.tools[i].tool, res: st.tools[i].result || {} });
+  }
+  if (!calls.length && !st.thoughts.length) { return; }
+  var det = document.createElement('details');
+  det.className = 'block';
+  var sum = document.createElement('summary');
+  sum.textContent = '它查了哪几处（' + (calls.length || st.thoughts.length) + ' 次）';
+  det.appendChild(sum);
+  if (!calls.length) {
+    var names = [];
+    for (var j = 0; j < st.thoughts.length; j++) {
+      var nm = st.thoughts[j].tool || '';
+      if (nm && names.indexOf(toolLabel(nm)) < 0) { names.push(toolLabel(nm)); }
+    }
+    var p = document.createElement('div');
+    p.className = 'src';
+    p.textContent = '已发起：' + (names.join('、') || '未知') + '（返回条数没有取到）';
+    det.appendChild(p);
+  }
+  for (var k = 0; k < calls.length; k++) {
+    var res = calls[k].res;
+    var row = document.createElement('div');
+    row.className = 'src';
+    var bits = [toolLabel(calls[k].tool)];
+    if (res.window && res.window.from && res.window.to) {
+      bits.push(res.window.from + ' 至 ' + res.window.to);
+    }
+    if (typeof res.returned === 'number') {
+      bits.push('返回 ' + res.returned + ' 条' +
+        (typeof res.total_seen === 'number' ? ' / 共 ' + res.total_seen + ' 条' : ''));
+    }
+    if (res.items_omitted) { bits.push('另有 ' + res.items_omitted + ' 条未展示'); }
+    bits.push(res.degrade_reason === 'OK' ? '正常' : ('状态 ' + (res.degrade_reason || '未知')));
+    row.textContent = bits.join(' · ');
+    det.appendChild(row);
+  }
+  node.appendChild(det);
+}
+
+function renderExtras(node, st) {
+  var results = [];
+  for (var i = 0; i < st.tools.length; i++) {
+    if (st.tools[i].result) { results.push(st.tools[i]); }
+  }
+  renderBanners(node, results);
+  renderItems(node, results);
+  renderEvents(node, results);
+  renderTrace(node, st);
+}
+
 // ---------- 发送 ----------
 async function sendText(promptText) {
   if (busy) { return; }
@@ -454,7 +832,8 @@ async function sendText(promptText) {
   var st = {
     t0: Date.now(), chunks: 0, bytes: 0, frames: 0, parseFail: 0,
     text: '', gotContent: false, firstTextMs: 0, stopped: false,
-    sessionSaved: false, usage: null, upstreamError: '', upstreamRequestId: '', renderTick: false
+    sessionSaved: false, usage: null, upstreamError: '', upstreamRequestId: '', renderTick: false,
+    tools: [], thoughts: []
   };
 
   var aiNode = addMsg('ai', '');
@@ -467,7 +846,7 @@ async function sendText(promptText) {
   var ac = new AbortController();
   var timeoutId = setTimeout(function () { ac.abort(); }, FRONT_TIMEOUT_MS);
   var sid = sessionId();
-  var input = { prompt: promptText };
+  var input = { prompt: promptText, show_process: showProcessOn() };
   if (sid) { input.session_id = sid; }
 
   try {
@@ -506,7 +885,8 @@ async function sendText(promptText) {
     st.endedAt = Date.now() - st.t0;
     stopWait();
     if (caret.parentNode) { caret.parentNode.removeChild(caret); }
-    aiNode.textContent = st.text || '';
+    renderAnswer(aiNode, st.text || '');
+    renderExtras(aiNode, st);
 
     if (st.stopped) {
       finishReport(st, rid);
@@ -648,6 +1028,9 @@ document.getElementById('btnSaveCfg').addEventListener('click', function () {
   saveToken(elTok2.value);
   elCfg.classList.add('hidden');
 });
+elProc.addEventListener('change', function () {
+  lsSet(KEY_PROC, elProc.checked ? '1' : '0');
+});
 document.getElementById('btnNewSess').addEventListener('click', function () {
   lsSet(KEY_SESSION, null);
   refreshStatus();
@@ -657,14 +1040,17 @@ document.getElementById('btnWipe').addEventListener('click', function () {
   lsSet(KEY_TOKEN, null);
   lsSet(KEY_SESSION, null);
   lsSet(KEY_BASE, null);
+  lsSet(KEY_PROC, null);
   elTok2.value = '';
+  elProc.checked = true;
   refreshStatus();
-  addMsg('ai', '本机数据已清空（口令、会话、接口地址）。');
+  addMsg('ai', '本机数据已清空（口令、会话、接口地址、显示选项）。');
 });
 
 // ---------- 启动 ----------
 (function boot() {
   if (!lsGet(KEY_BASE)) { lsSet(KEY_BASE, DEFAULT_BASE); }
+  elProc.checked = showProcessOn();
   refreshStatus();
   if (!token()) {
     openGate(false);
