@@ -145,6 +145,11 @@
   .block h4 { margin: 0 0 6px; font-size: 12.5px; color: var(--dim); font-weight: 600; }
   .rowitem { font-size: 13px; margin: 6px 0; line-height: 1.55; }
   .rowitem .m { font-size: 11.5px; color: var(--dim); }
+  /* 本次查询说明：放在回答最前面，一眼看到「共查了多少、只给了多少、缺了谁」 */
+  .sum {
+    font-size: 12px; color: var(--dim); line-height: 1.5; word-break: break-all;
+    border-left: 2px solid var(--line); padding: 4px 0 4px 8px; margin: 0 0 8px;
+  }
   .chk { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--dim); margin: 10px 0 0; }
   .chk input { width: auto; }
 </style>
@@ -183,6 +188,8 @@
     <input id="tokIn2" type="password" autocomplete="off" spellcheck="false">
     <label class="chk"><input id="optProcess" type="checkbox"> 显示「它查了哪几处」</label>
     <p class="src">开着才能在回答下面看到这次取回的材料与查询明细；关掉时只显示回答文本。</p>
+    <label class="chk"><input id="optTts" type="checkbox"> 朗读回答</label>
+    <p class="src">开着时，回答文字一边出现，本机语音一边念，每攒够两个完整句子开口一次。长回答可以随时点「停止」。</p>
     <div class="row">
       <button id="btnSaveCfg" class="primary" type="button">保存</button>
       <button id="btnNewSess" type="button">开新会话</button>
@@ -223,6 +230,7 @@ var KEY_BASE = 'h5page.base';
 var KEY_TOKEN = 'h5page.token';
 var KEY_SESSION = 'h5page.sessionId';
 var KEY_PROC = 'h5page.showProcess';
+var KEY_TTS = 'h5page.tts';
 var CHAT_PATH = '/api/chat';
 
 // 前端兜底超时 60 s。函数侧 TOTAL_DEADLINE 是 55 s，正常应该由服务端先收尾，
@@ -241,6 +249,7 @@ var elTok2 = document.getElementById('tokIn2');
 var elBase = document.getElementById('baseIn');
 var elTokMsg = document.getElementById('tokMsg');
 var elProc = document.getElementById('optProcess');
+var elTts = document.getElementById('optTts');
 
 var busy = false;
 var lastPrompt = '';
@@ -261,6 +270,8 @@ function token() { return lsGet(KEY_TOKEN) || ''; }
 function sessionId() { return lsGet(KEY_SESSION) || ''; }
 // 默认开：开着才能拿到工具返回、画材料清单与查询明细；存成 '0' 才算关。
 function showProcessOn() { return lsGet(KEY_PROC) !== '0'; }
+// 默认关：语音要用户自己开，不能一进页面就出声。
+function ttsOn() { return lsGet(KEY_TTS) === '1'; }
 
 function setStatus(text, color) {
   elStatus.textContent = text;      // 本页不用 innerHTML 拼任何东西：session_id 来自服务端，不例外
@@ -430,6 +441,7 @@ function makeFrameHandler(st, node, onDone) {
       st.text += out.text;
       node.textContent = st.text;
       st.renderTick = true;
+      ttsBatch(st);                              // 攒够两句就交给语音，不等全文
       window.scrollTo(0, document.body.scrollHeight);
     }
     if (out.finish_reason === 'stop') {           // 只认这个字符串，别用真值判断
@@ -495,6 +507,17 @@ var TOOL_LABEL = {
   news_search: '公司新闻', announcement_search: '公司公告', live_feed: '快讯',
   research_report: '研究报告', qa_search: '互动问答', policy_search: '政策与监管文件',
   event_calendar: '未来安排', document_text: '正文取回'
+};
+// 材料性质按「哪个工具取回来的」判，不按 source 判：source 实测是
+// mediaName / source / sourceName / host 四选一（server.py 第 2441 行），
+// 同一家媒体可能是中文名也可能是域名，没有稳定形状。工具名才是稳定的。
+var TOOL_NATURE = {
+  announcement_search: '披露原文',
+  policy_search: '政策原文',
+  research_report: '机构观点',
+  qa_search: '公司答复',
+  news_search: '媒体报道',
+  live_feed: '快讯'
 };
 var URL_RE = /https?:\/\/[^\s<>"'”’）)】]+/g;
 
@@ -572,6 +595,7 @@ function collectItems(results) {
       var key = it.url || (it.title + '|' + (it.published_at || ''));
       if (seen[key]) { continue; }
       seen[key] = 1;
+      if (!it._tool) { it._tool = results[i].tool || ''; }   // 同一事件只留第一条，性质随它
       out.push(it);
     }
   }
@@ -617,6 +641,14 @@ function appendItemRow(block, it) {
     tag2.className = 'tag';
     tag2.textContent = '只拿到标题';
     row.appendChild(tag2);
+  }
+  // 材料性质：说清这条是「谁说的」，比说清「从哪抓的」更有用
+  var nature = TOOL_NATURE[it._tool] || '';
+  if (nature) {
+    var nt = document.createElement('span');
+    nt.className = 'tag';
+    nt.textContent = nature;
+    row.appendChild(nt);
   }
   var meta = document.createElement('div');
   meta.className = 'm';
@@ -808,6 +840,46 @@ function renderTrace(node, st) {
   node.appendChild(det);
 }
 
+// 本次查询说明：共查了几类、给了多少条、时间窗、缺了谁。
+// 数据全在 st.tools 里，纯前端拼一行字，不多花一个 token。
+function renderSummary(node, st) {
+  var calls = [];
+  for (var i = 0; i < st.tools.length; i++) {
+    if (st.tools[i].result) { calls.push(st.tools[i]); }
+  }
+  if (!calls.length) { return; }
+  var kinds = {}, kindCount = 0;
+  var returned = 0, seen = 0, hasReturned = false, hasSeen = false;
+  var from = '', to = '';
+  var missing = [], degraded = 0;
+  for (var j = 0; j < calls.length; j++) {
+    var r = calls[j].result || {};
+    var t = calls[j].tool || '';
+    if (t && !kinds[t]) { kinds[t] = 1; kindCount += 1; }
+    if (typeof r.returned === 'number') { returned += r.returned; hasReturned = true; }
+    if (typeof r.total_seen === 'number') { seen += r.total_seen; hasSeen = true; }
+    if (r.window && r.window.from && (!from || r.window.from < from)) { from = r.window.from; }
+    if (r.window && r.window.to && (!to || r.window.to > to)) { to = r.window.to; }
+    if (r.missing_sources && r.missing_sources.length) {
+      for (var k = 0; k < r.missing_sources.length; k++) {
+        if (missing.indexOf(r.missing_sources[k]) < 0) { missing.push(r.missing_sources[k]); }
+      }
+    }
+    if (r.degrade_reason && r.degrade_reason !== 'OK') { degraded += 1; }
+  }
+  var bits = ['查了 ' + kindCount + ' 类'];
+  if (hasReturned) {
+    bits.push('返回 ' + returned + ' 条' + (hasSeen ? ' / 共 ' + seen + ' 条' : ''));
+  }
+  if (from && to) { bits.push('时间窗 ' + from + ' 至 ' + to); }
+  if (missing.length) { bits.push('缺 ' + missing.join('、')); }
+  if (degraded) { bits.push('其中 ' + degraded + ' 类这次取不到'); }
+  var d = document.createElement('div');
+  d.className = 'sum';
+  d.textContent = bits.join(' · ');
+  node.insertBefore(d, node.firstChild);
+}
+
 function renderExtras(node, st) {
   var results = [];
   for (var i = 0; i < st.tools.length; i++) {
@@ -819,6 +891,147 @@ function renderExtras(node, st) {
   renderTrace(node, st);
 }
 
+// ---------- 语音朗读 ----------
+// 只念清洗过的副本，页面上那份带链接的文字一个字都不动。
+// 两句一批：一句太碎，三句首声就晚。队列必然积压——文字先出完、语音后念完，靠「停止」收。
+var ttsQueue = [];
+var ttsBusy = false;
+
+function ttsAvailable() {
+  return typeof window.speechSynthesis !== 'undefined' &&
+         typeof window.SpeechSynthesisUtterance !== 'undefined';
+}
+
+// iOS 只认「真实点击」里的第一次 speak。先占住音频通道，后面异步 speak 才有声。
+function ttsPrime() {
+  if (!ttsOn() || !ttsAvailable()) { return; }
+  try {
+    var u = new SpeechSynthesisUtterance(' ');
+    u.volume = 0.01;                 // 0 会被部分浏览器直接跳过，留一点更稳
+    window.speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+function ttsStop() {
+  ttsQueue = [];
+  ttsBusy = false;
+  if (ttsAvailable()) {
+    try { window.speechSynthesis.cancel(); } catch (e) {}
+  }
+}
+
+// 按句末标点切成句子。末尾没有标点的那截标成 complete:false，留给收尾补念。
+function ttsSplit(text) {
+  var out = [];
+  var start = 0;
+  for (var i = 0; i < text.length; i++) {
+    var c = text.charAt(i);
+    if (c === '。' || c === '！' || c === '？' || c === '；' || c === '\n') {
+      out.push({ end: i + 1, text: text.slice(start, i + 1), complete: true });
+      start = i + 1;
+    }
+  }
+  if (start < text.length) {
+    out.push({ end: text.length, text: text.slice(start), complete: false });
+  }
+  return out;
+}
+
+// 念不出来的东西先摘掉：链接、列表符号、星号、整行来源、行尾来源括注
+function scrubForTts(text) {
+  return text.replace(URL_RE, '')
+    .replace(/^[ \t]*[-*#]+[ \t]+/gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/^[（(]?\s*来源[：:].*$/gm, '')
+    .replace(/[（(]\s*来源[：:][^）)]{0,80}[）)]/g, '')
+    .replace(/重要度\s*\d+\s*[·•]\s*/g, '')
+    .replace(/[·•]/g, '，')
+    .replace(/[ \t\u3000]{2,}/g, ' ');
+}
+
+function ttsDrain() {
+  if (ttsBusy || !ttsQueue.length) { return; }
+  var text = ttsQueue.shift();
+  ttsBusy = true;
+  var u = new SpeechSynthesisUtterance(text);
+  u.lang = 'zh-CN';
+  u.rate = 1.0;
+  u.onend = function () { ttsBusy = false; ttsDrain(); };
+  u.onerror = function () { ttsBusy = false; ttsDrain(); };
+  try {
+    window.speechSynthesis.speak(u);
+  } catch (e) {
+    ttsBusy = false;
+    ttsDrain();
+  }
+}
+
+// 流式帧每追加一段就调一次：只要后面还有两个完整句，就切出来入队
+function ttsBatch(st) {
+  if (!ttsOn() || !ttsAvailable()) { return; }
+  var sents = ttsSplit(st.text.slice(st.spokenIdx));
+  var i = 0;
+  while (i + 1 < sents.length && sents[i + 1].complete) {
+    var joined = sents[i].text + sents[i + 1].text;
+    var clean = scrubForTts(joined);
+    i += 2;
+    if (clean.replace(/\s/g, '')) { ttsQueue.push(clean); }
+  }
+  if (i > 0) { st.spokenIdx += sents[i - 1].end; }
+  ttsDrain();
+}
+
+// 只在本轮真的收到 stop 帧时调：把最后不足两句的尾巴补进去。
+// 超时或截断时不调，避免把半截回答念成完整结论。
+function ttsFlushTail(st) {
+  if (!ttsOn() || !ttsAvailable()) { return; }
+  var clean = scrubForTts(st.text.slice(st.spokenIdx));
+  st.spokenIdx = st.text.length;
+  if (clean.replace(/\s/g, '')) {
+    ttsQueue.push(clean);
+    ttsDrain();
+  }
+}
+
+// 兜底按钮：整段重念，约 60 字一段，避免单个 utterance 太长被浏览器截断
+function ttsSpeakAll(text) {
+  ttsStop();
+  var sents = ttsSplit(scrubForTts(text));
+  var buf = '';
+  for (var i = 0; i < sents.length; i++) {
+    buf += sents[i].text;
+    if (buf.length >= 60) { ttsQueue.push(buf); buf = ''; }
+  }
+  if (buf.replace(/\s/g, '')) { ttsQueue.push(buf); }
+  ttsDrain();
+}
+
+function addTtsBtn(node, st) {
+  if (!ttsAvailable()) { return; }
+  var timer = 0;
+  var b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = (ttsBusy || ttsQueue.length) ? '停止' : '朗读';
+  b.addEventListener('click', function () {
+    if (timer) { clearInterval(timer); timer = 0; }
+    if (ttsBusy || ttsQueue.length) {
+      ttsStop();
+      b.textContent = '朗读';
+      return;
+    }
+    ttsSpeakAll(st.text);
+    b.textContent = '停止';
+    timer = setInterval(function () {
+      if (!ttsBusy && !ttsQueue.length) {
+        clearInterval(timer);
+        timer = 0;
+        b.textContent = '朗读';
+      }
+    }, 500);
+  });
+  node.appendChild(b);
+}
+
 // ---------- 发送 ----------
 async function sendText(promptText) {
   if (busy) { return; }
@@ -828,13 +1041,15 @@ async function sendText(promptText) {
   busy = true;
   elSend.disabled = true;
   lastPrompt = promptText;
+  ttsStop();                     // 新一轮开始，先把上一条没念完的停掉
+  ttsPrime();                    // 必须在 ttsStop 之后：先解锁再开声，否则预热会被 cancel 掉
   addMsg('me', promptText);
 
   var st = {
     t0: Date.now(), chunks: 0, bytes: 0, frames: 0, parseFail: 0,
     text: '', gotContent: false, firstTextMs: 0, stopped: false,
     sessionSaved: false, usage: null, upstreamError: '', upstreamRequestId: '', renderTick: false,
-    tools: [], thoughts: []
+    tools: [], thoughts: [], spokenIdx: 0
   };
 
   var aiNode = addMsg('ai', '');
@@ -887,9 +1102,12 @@ async function sendText(promptText) {
     stopWait();
     if (caret.parentNode) { caret.parentNode.removeChild(caret); }
     renderAnswer(aiNode, st.text || '');
+    renderSummary(aiNode, st);      // 插在正文最前：查了几类、给了多少、缺了谁
     renderExtras(aiNode, st);
+    addTtsBtn(aiNode, st);
 
     if (st.stopped) {
+      ttsFlushTail(st);          // 收到 stop 帧，最后不足两句的尾巴补念
       finishReport(st, rid);
     } else if (st.upstreamError) {
       addMeta(aiNode, '上游在流里报了错：' + st.upstreamError);
@@ -1032,6 +1250,14 @@ document.getElementById('btnSaveCfg').addEventListener('click', function () {
 elProc.addEventListener('change', function () {
   lsSet(KEY_PROC, elProc.checked ? '1' : '0');
 });
+elTts.addEventListener('change', function () {
+  lsSet(KEY_TTS, elTts.checked ? '1' : '0');
+  if (elTts.checked) { ttsPrime(); } else { ttsStop(); }
+});
+// 切到后台就停，避免锁屏之后还在念
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) { ttsStop(); }
+});
 document.getElementById('btnNewSess').addEventListener('click', function () {
   lsSet(KEY_SESSION, null);
   refreshStatus();
@@ -1042,16 +1268,20 @@ document.getElementById('btnWipe').addEventListener('click', function () {
   lsSet(KEY_SESSION, null);
   lsSet(KEY_BASE, null);
   lsSet(KEY_PROC, null);
+  lsSet(KEY_TTS, null);
   elTok2.value = '';
   elProc.checked = true;
+  elTts.checked = false;
+  ttsStop();
   refreshStatus();
-  addMsg('ai', '本机数据已清空（口令、会话、接口地址、显示选项）。');
+  addMsg('ai', '本机数据已清空（口令、会话、接口地址、显示选项、朗读开关）。');
 });
 
 // ---------- 启动 ----------
 (function boot() {
   if (!lsGet(KEY_BASE)) { lsSet(KEY_BASE, DEFAULT_BASE); }
   elProc.checked = showProcessOn();
+  elTts.checked = ttsOn();
   refreshStatus();
   if (!token()) {
     openGate(false);
